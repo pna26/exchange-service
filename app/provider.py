@@ -1,4 +1,7 @@
-"""Clientes das APIs de câmbio: AwesomeAPI (principal) e PTAX do BACEN (fallback).
+"""Clientes das APIs de câmbio: PTAX do Banco Central (principal, EXCHANGE_PROVIDER=ptax)
+e AwesomeAPI (EXCHANGE_PROVIDER=awesomeapi, com a PTAX como fallback opcional).
+
+AwesomeAPI:
 
     GET https://economia.awesomeapi.com.br/json/last/USD-BRL
     -> {"USDBRL": {"bid": "5.39", "ask": "5.40", "create_date": "2026-11-05 10:00:00", ...}}
@@ -14,11 +17,21 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from prometheus_client import Counter, Histogram
 
+_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5)
+
+# provedor PRINCIPAL, seja ele qual for (o painel "API externa" do Grafana usa esta)
 UPSTREAM_SECONDS = Histogram(
     "exchange_upstream_request_seconds",
-    "Tempo das chamadas à API de câmbio externa",
+    "Tempo das chamadas à API de câmbio externa (provedor principal)",
+    ["outcome"],  # ok | not_found | error
+    buckets=_BUCKETS,
+)
+# PTAX quando ela é só o fallback da AwesomeAPI
+PTAX_FALLBACK_SECONDS = Histogram(
+    "exchange_ptax_request_seconds",
+    "Tempo das chamadas à PTAX quando ela é o fallback da AwesomeAPI",
     ["outcome"],
-    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5),
+    buckets=_BUCKETS,
 )
 
 
@@ -38,10 +51,12 @@ class UpstreamError(Exception):
 
 
 class AwesomeApiProvider:
-    def __init__(self, client: httpx.AsyncClient, base_url: str, token: str | None = None):
+    def __init__(self, client: httpx.AsyncClient, base_url: str, token: str | None = None,
+                 metric: Histogram = UPSTREAM_SECONDS):
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._token = token
+        self._metric = metric
 
     async def fetch(self, src: str, dst: str) -> Quote:
         params = {"token": self._token} if self._token else None
@@ -68,106 +83,111 @@ class AwesomeApiProvider:
             outcome = "ok"
             return quote
         finally:
-            UPSTREAM_SECONDS.labels(outcome).observe(time.perf_counter() - start)
+            self._metric.labels(outcome).observe(time.perf_counter() - start)
 
 
 # ---------------------------------------------------------------------------
-# Fallback: PTAX do Banco Central (API Olinda, pública e sem cadastro)
+# PTAX do Banco Central (API Olinda, pública e sem cadastro)
 # ---------------------------------------------------------------------------
 #
-# Por que: no EKS a AwesomeAPI responde 429 para o IP do NAT da AWS (o plano
-# gratuito limita IPs de nuvem), e o exchange devolvia 503. O BACEN não tem
-# esse limite.
+# Por que: as APIs de câmbio gratuitas (AwesomeAPI etc.) não respondem para IPs
+# da AWS (no EKS a AwesomeAPI devolve 429 para o IP do NAT). O BACEN responde.
 #
-#   GET {PTAX_BASE_URL}/CotacaoMoedaPeriodo(moeda=@moeda,dataInicial=@dataInicial,
+#   GET {PTAX_URL}/CotacaoMoedaPeriodo(moeda=@moeda,dataInicial=@dataInicial,
 #       dataFinalCotacao=@dataFinalCotacao)?@moeda='EUR'&@dataInicial='11-13-2026'
-#       &@dataFinalCotacao='11-20-2026'&$format=json
+#       &@dataFinalCotacao='11-20-2026'&$format=json&$select=cotacaoCompra,cotacaoVenda,dataHoraCotacao
 #   -> {"value": [{"cotacaoCompra": 6.3702, "cotacaoVenda": 6.372,
-#                  "dataHoraCotacao": "2026-11-18 13:08:44.271245",
-#                  "tipoBoletim": "Fechamento", ...}, ...]}
+#                  "dataHoraCotacao": "2026-11-18 13:08:44.271245"}, ...]}
 #
-# A PTAX só cota moeda -> BRL e só para as 10 moedas abaixo (endpoint Moedas).
-# Moeda desconhecida devolve "value": [] com status 200, por isso a lista fixa:
-# moeda fora dela é PairNotFound sem chamada; lista vazia para moeda conhecida
-# é UpstreamError (o BACEN não publicou nada na janela).
-
-PTAX_SECONDS = Histogram(
-    "exchange_ptax_request_seconds",
-    "Tempo das chamadas à API PTAX do Banco Central (fallback)",
-    ["outcome"],
-    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5),
-)
+# As linhas vêm em ordem de tempo; usamos a última (rows[-1]). A janela de 7
+# dias cobre fins de semana e feriados. A PTAX só cota moeda -> BRL; BRL vale 1
+# e qualquer par sai pela taxa cruzada via BRL:
+#     sell = venda(src) / compra(dst)     buy = compra(src) / venda(dst)
+# Moeda que o BACEN não conhece devolve "value": [] (200) -> PairNotFound (404).
 
 PTAX_CURRENCIES = frozenset({"AUD", "CAD", "CHF", "DKK", "EUR", "GBP", "JPY", "NOK", "SEK", "USD"})
-PTAX_WINDOW_DAYS = 7  # fins de semana e feriados não têm cotação
+PTAX_WINDOW_DAYS = 7
 
 
 class PtaxProvider:
-    """Cotação PTAX. Suporta X->BRL, BRL->X (invertido) e X->Y (cruzado via BRL)."""
-
-    def __init__(self, client: httpx.AsyncClient, base_url: str, today=None):
+    def __init__(self, client: httpx.AsyncClient, base_url: str, today=None,
+                 metric: Histogram = UPSTREAM_SECONDS):
         self._client = client
         self._base_url = base_url.rstrip("/")
         self._today = today or (lambda: datetime.now(timezone.utc).date())
+        self._metric = metric
+        self._currencies: list[dict] | None = None
 
     async def fetch(self, src: str, dst: str) -> Quote:
+        # atalho: moeda fora da lista da PTAX nem chama o BACEN
         for cur in (src, dst):
             if cur != "BRL" and cur not in PTAX_CURRENCIES:
                 raise PairNotFound(f"{src}-{dst}")
+        c_src, v_src, d_src = await self._rate(src)
+        c_dst, v_dst, d_dst = await self._rate(dst)
+        dates = [d for d in (d_src, d_dst) if d]
+        return Quote(sell=round(v_src / c_dst, 6), buy=round(c_src / v_dst, 6), date=min(dates))
 
-        if dst == "BRL":
-            return await self._to_brl(src)
-        if src == "BRL":
-            q = await self._to_brl(dst)
-            # quem vende BRL e recebe X: 1/compra; manter sell >= buy
-            return Quote(sell=round(1 / q.buy, 6), buy=round(1 / q.sell, 6), date=q.date)
-        # cruzado: X->Y = (X->BRL) / (Y->BRL); o spread dos dois lados se soma
-        x, y = await self._to_brl(src), await self._to_brl(dst)
-        return Quote(sell=round(x.sell / y.buy, 6), buy=round(x.buy / y.sell, 6), date=min(x.date, y.date))
-
-    async def _to_brl(self, cur: str) -> Quote:
+    async def _rate(self, cur: str) -> tuple[float, float, str | None]:
+        """(compra, venda, data) da moeda em BRL; BRL vale 1."""
+        if cur == "BRL":
+            return 1.0, 1.0, None
         end = self._today()
-        start_day = end - timedelta(days=PTAX_WINDOW_DAYS)
         fmt = "%m-%d-%Y"
         url = (
             f"{self._base_url}/CotacaoMoedaPeriodo(moeda=@moeda,dataInicial=@dataInicial,"
             f"dataFinalCotacao=@dataFinalCotacao)?@moeda='{cur}'"
-            f"&@dataInicial='{start_day.strftime(fmt)}'&@dataFinalCotacao='{end.strftime(fmt)}'&$format=json"
+            f"&@dataInicial='{(end - timedelta(days=PTAX_WINDOW_DAYS)).strftime(fmt)}'"
+            f"&@dataFinalCotacao='{end.strftime(fmt)}'"
+            f"&$format=json&$select=cotacaoCompra,cotacaoVenda,dataHoraCotacao"
         )
         start = time.perf_counter()
         outcome = "error"
         try:
+            rows = (await self._get_json(url))["value"]
+            if not isinstance(rows, list):
+                raise UpstreamError("PTAX resposta inesperada: value não é lista")
+            if not rows:
+                outcome = "not_found"
+                raise PairNotFound(cur)
             try:
-                resp = await self._client.get(url)
-            except httpx.HTTPError as e:
-                raise UpstreamError(str(e)) from e
-            if resp.status_code != 200:
-                raise UpstreamError(f"PTAX status {resp.status_code}")
-            try:
-                quote = _pick_ptax(resp.json()["value"])
-            except (ValueError, KeyError, TypeError, IndexError) as e:
+                last = rows[-1]
+                rate = float(last["cotacaoCompra"]), float(last["cotacaoVenda"]), str(last["dataHoraCotacao"])[:19]
+            except (ValueError, KeyError, TypeError) as e:
                 raise UpstreamError(f"PTAX resposta inesperada: {e!r}") from e
             outcome = "ok"
-            return quote
+            return rate
         finally:
-            PTAX_SECONDS.labels(outcome).observe(time.perf_counter() - start)
+            self._metric.labels(outcome).observe(time.perf_counter() - start)
 
+    async def currencies(self) -> list[dict]:
+        """Moedas que a PTAX cota ([{symbol, name}]). Guardado depois do 1º sucesso."""
+        if self._currencies is None:
+            data = await self._get_json(f"{self._base_url}/Moedas?$format=json&$select=simbolo,nomeFormatado")
+            try:
+                self._currencies = [{"symbol": m["simbolo"], "name": m["nomeFormatado"]} for m in data["value"]]
+            except (KeyError, TypeError) as e:
+                raise UpstreamError(f"PTAX resposta inesperada: {e!r}") from e
+        return self._currencies
 
-def _pick_ptax(rows: list[dict]) -> Quote:
-    """Último boletim de Fechamento da janela; sem ele, a última cotação da lista."""
-    if not rows:
-        raise IndexError("nenhuma cotação PTAX na janela")
-    closing = [r for r in rows if r.get("tipoBoletim") == "Fechamento"]
-    row = max(closing or rows, key=lambda r: r["dataHoraCotacao"])
-    return Quote(
-        sell=float(row["cotacaoVenda"]),
-        buy=float(row["cotacaoCompra"]),
-        date=str(row["dataHoraCotacao"])[:19],
-    )
+    async def _get_json(self, url: str):
+        try:
+            resp = await self._client.get(url)
+        except httpx.HTTPError as e:
+            raise UpstreamError(str(e)) from e
+        if resp.status_code != 200:
+            raise UpstreamError(f"PTAX status {resp.status_code}")
+        try:
+            data = resp.json()
+            data["value"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise UpstreamError(f"PTAX resposta inesperada: {e!r}") from e
+        return data
 
 
 # ---------------------------------------------------------------------------
-# Provedor composto: AwesomeAPI e, se ela falhar, PTAX
+# Provedor composto (só no modo EXCHANGE_PROVIDER=awesomeapi): AwesomeAPI e,
+# se ela falhar, PTAX
 # ---------------------------------------------------------------------------
 
 FALLBACK_TOTAL = Counter(

@@ -1,6 +1,6 @@
 """Bottleneck: cache da cotação.
 
-Sem cache, cada GET /exchange/USD/BRL vira uma chamada HTTP para a API externa:
+Sem cache, cada GET /exchange/USD/EUR vira chamadas HTTP para a API externa (PTAX):
 latência de rede de terceiros no caminho de toda requisição e risco de bater no
 limite de requisições da API (que derruba o serviço para todo mundo).
 
@@ -47,17 +47,21 @@ class QuoteCache:
         return None
 
     async def get(self, src: str, dst: str) -> Quote:
+        return (await self.lookup(src, dst))[0]
+
+    async def lookup(self, src: str, dst: str) -> tuple[Quote, str]:
+        """Cotação e de onde ela veio: "hit", "miss" ou "stale" (vai no header X-Cache)."""
         key = (src, dst)
         if self._ttl > 0 and (quote := self._fresh(key)):
             CACHE_RESULTS.labels("hit").inc()
-            return quote
+            return quote, "hit"
 
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             # outra requisição pode ter atualizado o cache enquanto esperávamos o lock
             if self._ttl > 0 and (quote := self._fresh(key)):
                 CACHE_RESULTS.labels("hit").inc()
-                return quote
+                return quote, "hit"
 
             try:
                 quote = await self._fetch(src, dst)
@@ -68,10 +72,10 @@ class QuoteCache:
                 entry = self._entries.get(key)
                 if entry and self._clock() - entry[1] < self._stale_ttl:
                     CACHE_RESULTS.labels("stale").inc()
-                    return entry[0]
+                    return entry[0], "stale"
                 CACHE_RESULTS.labels("error").inc()
                 raise
 
             CACHE_RESULTS.labels("miss").inc()
             self._entries[key] = (quote, self._clock())
-            return quote
+            return quote, "miss"

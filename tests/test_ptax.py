@@ -1,4 +1,4 @@
-"""Testes do fallback PTAX (Banco Central) com as duas APIs simuladas, sem rede."""
+"""Testes da PTAX (provedor padrão) e do modo awesomeapi com fallback, sem rede."""
 
 import asyncio
 from datetime import date
@@ -19,26 +19,30 @@ from app.provider import (
 AWESOME = "https://awesome.test/json/last"
 PTAX = "https://ptax.test/odata"
 
-# formato real do BACEN (CotacaoMoedaPeriodo), recortado
-PTAX_EUR = {
-    "value": [
-        {"cotacaoCompra": 6.3702, "cotacaoVenda": 6.372, "dataHoraCotacao": "2026-11-18 13:08:44.271245", "tipoBoletim": "Fechamento"},
-        {"cotacaoCompra": 6.4767, "cotacaoVenda": 6.4779, "dataHoraCotacao": "2026-11-19 10:11:10.714595", "tipoBoletim": "Abertura"},
-        {"cotacaoCompra": 6.4659, "cotacaoVenda": 6.4672, "dataHoraCotacao": "2026-11-19 13:04:18.325373", "tipoBoletim": "Fechamento"},
-        {"cotacaoCompra": 6.5, "cotacaoVenda": 6.51, "dataHoraCotacao": "2026-11-20 10:10:00.000000", "tipoBoletim": "Abertura"},
-    ]
-}
-# CotacaoDolarPeriodo não tem tipoBoletim
+# formato real do BACEN (CotacaoMoedaPeriodo com $select), linhas em ordem de tempo
 PTAX_USD = {
     "value": [
         {"cotacaoCompra": 5.8096, "cotacaoVenda": 5.8102, "dataHoraCotacao": "2026-11-18 13:08:44.271245"},
         {"cotacaoCompra": 5.8883, "cotacaoVenda": 5.8889, "dataHoraCotacao": "2026-11-19 13:04:18.325373"},
     ]
 }
+PTAX_EUR = {
+    "value": [
+        {"cotacaoCompra": 6.3702, "cotacaoVenda": 6.372, "dataHoraCotacao": "2026-11-18 13:08:44.271245"},
+        {"cotacaoCompra": 6.4659, "cotacaoVenda": 6.4672, "dataHoraCotacao": "2026-11-19 13:04:18.325373"},
+        {"cotacaoCompra": 6.5, "cotacaoVenda": 6.51, "dataHoraCotacao": "2026-11-20 10:10:00.000000"},
+    ]
+}
+PTAX_MOEDAS = {
+    "value": [
+        {"simbolo": "EUR", "nomeFormatado": "Euro"},
+        {"simbolo": "USD", "nomeFormatado": "Dólar dos Estados Unidos"},
+    ]
+}
 
 
 class FakeApis:
-    """Simula AwesomeAPI e PTAX no mesmo transport e conta as chamadas de cada uma."""
+    """Simula PTAX e AwesomeAPI no mesmo transport e conta as chamadas de cada uma."""
 
     def __init__(self, awesome_status=429, ptax_status=200, ptax_bodies=None, ptax_fail=False):
         self.awesome_status = awesome_status
@@ -58,6 +62,8 @@ class FakeApis:
                 raise httpx.ConnectTimeout("timeout", request=request)
             if self.ptax_status != 200:
                 return httpx.Response(self.ptax_status)
+            if "/Moedas" in url:
+                return httpx.Response(200, json=PTAX_MOEDAS)
             cur = next((c for c in self.ptax_bodies if f"@moeda='{c}'" in url or f"%27{c}%27" in url), None)
             return httpx.Response(200, json=self.ptax_bodies.get(cur, {"value": []}))
         self.awesome_calls += 1
@@ -83,29 +89,48 @@ async def _fallback_fetch(api, src, dst):
 
 # --- PtaxProvider -----------------------------------------------------------
 
-def test_ptax_parse_usd_brl():
+def test_ptax_moeda_para_brl():
     api = FakeApis()
     q = run(_ptax_fetch(api, "USD", "BRL"))
     assert (q.sell, q.buy, q.date) == (5.8889, 5.8883, "2026-11-19 13:04:18")
-    # janela de 7 dias para trás, datas no formato MM-DD-YYYY do OData
-    assert "11-13-2026" in api.ptax_urls[0] and "11-20-2026" in api.ptax_urls[0]
+    # janela de 7 dias para trás, datas MM-DD-YYYY do OData, só os campos usados
+    url = api.ptax_urls[0]
+    assert "11-13-2026" in url and "11-20-2026" in url
+    assert "$select=cotacaoCompra,cotacaoVenda,dataHoraCotacao" in url
+    assert api.ptax_calls == 1  # BRL vale 1, não chama o BACEN
 
 
-def test_ptax_prefere_ultimo_fechamento():
+def test_ptax_usa_o_ultimo_boletim():
     q = run(_ptax_fetch(FakeApis(), "EUR", "BRL"))
-    # a abertura de 20/11 é mais nova, mas o fechamento de 19/11 é a PTAX do dia
-    assert (q.sell, q.buy, q.date) == (6.4672, 6.4659, "2026-11-19 13:04:18")
+    assert (q.sell, q.buy, q.date) == (6.51, 6.5, "2026-11-20 10:10:00")  # rows[-1]
 
 
-def test_ptax_sem_fechamento_pega_a_ultima():
-    body = {"value": [PTAX_EUR["value"][3], PTAX_EUR["value"][1]]}  # só aberturas, fora de ordem
-    q = run(_ptax_fetch(FakeApis(ptax_bodies={"EUR": body}), "EUR", "BRL"))
-    assert q.sell == 6.51
+def test_ptax_brl_para_moeda():
+    q = run(_ptax_fetch(FakeApis(), "BRL", "USD"))
+    assert q.sell == round(1 / 5.8883, 6)
+    assert q.buy == round(1 / 5.8889, 6)
+    assert q.sell >= q.buy
 
 
-def test_ptax_lista_vazia_e_upstream_error():
-    with pytest.raises(UpstreamError):
+def test_ptax_cruzado_usd_eur():
+    q = run(_ptax_fetch(FakeApis(), "USD", "EUR"))
+    # fórmula do roteiro: sell = venda(src) / compra(dst), buy = compra(src) / venda(dst)
+    assert q.sell == round(5.8889 / 6.5, 6)
+    assert q.buy == round(5.8883 / 6.51, 6)
+    assert q.sell >= q.buy
+    assert q.date == "2026-11-19 13:04:18"  # a mais antiga das duas
+
+
+def test_ptax_lista_vazia_e_moeda_desconhecida():
+    with pytest.raises(PairNotFound):
         run(_ptax_fetch(FakeApis(ptax_bodies={"USD": {"value": []}}), "USD", "BRL"))
+
+
+def test_ptax_moeda_fora_da_lista_nao_chama_api():
+    api = FakeApis()
+    with pytest.raises(PairNotFound):
+        run(_ptax_fetch(api, "BTC", "BRL"))
+    assert api.ptax_calls == 0
 
 
 def test_ptax_resposta_invalida_e_upstream_error():
@@ -113,28 +138,87 @@ def test_ptax_resposta_invalida_e_upstream_error():
         run(_ptax_fetch(FakeApis(ptax_bodies={"USD": {"erro": 1}}), "USD", "BRL"))
 
 
-def test_ptax_brl_para_moeda_invertido():
-    q = run(_ptax_fetch(FakeApis(), "BRL", "USD"))
-    assert q.sell == round(1 / 5.8883, 6)
-    assert q.buy == round(1 / 5.8889, 6)
-    assert q.sell >= q.buy
+# --- rota no modo padrão (PTAX) ----------------------------------------------
+
+@pytest.fixture
+def env(monkeypatch):
+    monkeypatch.delenv("EXCHANGE_PROVIDER", raising=False)
+    monkeypatch.setenv("PTAX_URL", PTAX)
+    monkeypatch.setenv("EXCHANGE_API_URL", AWESOME)
+    return monkeypatch
 
 
-def test_ptax_cruzado_via_brl():
-    q = run(_ptax_fetch(FakeApis(), "EUR", "USD"))
-    assert q.sell == round(6.4672 / 5.8883, 6)
-    assert q.buy == round(6.4659 / 5.8889, 6)
-    assert q.sell >= q.buy
+def get(client, path):
+    return client.get(path, headers={"id-account": "42"})
 
 
-def test_ptax_moeda_desconhecida_nao_chama_api():
+def test_rota_ptax_padrao_e_x_cache_miss_depois_hit(env):
     api = FakeApis()
-    with pytest.raises(PairNotFound):
-        run(_ptax_fetch(api, "BTC", "BRL"))
-    assert api.ptax_calls == 0
+    with TestClient(create_app(transport=httpx.MockTransport(api))) as c:
+        r1 = get(c, "/exchange/USD/BRL")
+        r2 = get(c, "/exchange/USD/BRL")
+    assert r1.status_code == 200
+    assert r1.json() == {"sell": 5.8889, "buy": 5.8883, "date": "2026-11-19 13:04:18", "id-account": "42"}
+    assert r1.headers["X-Cache"] == "miss"
+    assert r2.headers["X-Cache"] == "hit"
+    assert api.ptax_calls == 1 and api.awesome_calls == 0  # AwesomeAPI nem é chamada
 
 
-# --- FallbackProvider --------------------------------------------------------
+def test_rota_alias_exchanges(env):
+    with TestClient(create_app(transport=httpx.MockTransport(FakeApis()))) as c:
+        r = get(c, "/exchanges/USD/EUR")
+    assert r.status_code == 200
+    assert r.json()["sell"] == round(5.8889 / 6.5, 6)
+
+
+def test_rota_moeda_desconhecida_404(env):
+    api = FakeApis(ptax_bodies={})  # BACEN devolve "value": [] para tudo
+    with TestClient(create_app(transport=httpx.MockTransport(api))) as c:
+        assert get(c, "/exchange/USD/BRL").status_code == 404
+        assert get(c, "/exchange/XYZ/BRL").status_code == 404
+
+
+def test_rota_status_400_e_401(env):
+    with TestClient(create_app(transport=httpx.MockTransport(FakeApis()))) as c:
+        assert get(c, "/exchange/US/BRL").status_code == 400
+        assert c.get("/exchange/USD/BRL").status_code == 401
+
+
+@pytest.mark.parametrize("falha", [{"ptax_status": 500}, {"ptax_fail": True}])
+def test_rota_ptax_fora_sem_cache_503(env, falha):
+    with TestClient(create_app(transport=httpx.MockTransport(FakeApis(**falha)))) as c:
+        assert get(c, "/exchange/USD/BRL").status_code == 503
+
+
+def test_rota_ptax_fora_com_cache_vencido_stale(env):
+    env.setenv("CACHE_TTL", "0")  # toda cotação já nasce vencida
+    api = FakeApis()
+    with TestClient(create_app(transport=httpx.MockTransport(api))) as c:
+        assert get(c, "/exchange/USD/BRL").headers["X-Cache"] == "miss"
+        api.ptax_fail = True
+        r = get(c, "/exchange/USD/BRL")
+        text = c.get("/metrics").text
+    assert r.status_code == 200
+    assert r.headers["X-Cache"] == "stale"
+    assert r.json()["sell"] == 5.8889
+    assert 'exchange_quote_cache_total{result="stale"}' in text
+    # no modo ptax a métrica do "API externa" do Grafana mede a PTAX
+    assert 'exchange_upstream_request_seconds_count{outcome="ok"}' in text
+
+
+def test_rota_currencies(env):
+    with TestClient(create_app(transport=httpx.MockTransport(FakeApis()))) as c:
+        r = get(c, "/exchange/currencies")
+    assert r.status_code == 200
+    assert r.json() == [{"symbol": "EUR", "name": "Euro"}, {"symbol": "USD", "name": "Dólar dos Estados Unidos"}]
+
+
+def test_rota_currencies_ptax_fora_503(env):
+    with TestClient(create_app(transport=httpx.MockTransport(FakeApis(ptax_status=502)))) as c:
+        assert get(c, "/exchange/currencies").status_code == 503
+
+
+# --- modo awesomeapi com fallback PTAX ---------------------------------------
 
 def test_fallback_acionado_no_429():
     api = FakeApis(awesome_status=429)
@@ -162,28 +246,17 @@ def test_fallback_par_nao_suportado_mantem_erro_original():
         run(_fallback_fetch(FakeApis(awesome_status=503), "BTC", "BRL"))
 
 
-# --- rota ----------------------------------------------------------------------
-
-@pytest.fixture
-def env(monkeypatch):
-    monkeypatch.setenv("EXCHANGE_API_URL", AWESOME)
-    monkeypatch.setenv("PTAX_BASE_URL", PTAX)
-    return monkeypatch
-
-
-def get(client, path):
-    return client.get(path, headers={"id-account": "42"})
-
-
-def test_rota_usa_ptax_quando_awesome_da_429(env):
+def test_rota_awesomeapi_usa_ptax_no_429(env):
+    env.setenv("EXCHANGE_PROVIDER", "awesomeapi")
     api = FakeApis(awesome_status=429)
     with TestClient(create_app(transport=httpx.MockTransport(api))) as c:
         r = get(c, "/exchange/USD/BRL")
     assert r.status_code == 200
-    assert r.json() == {"sell": 5.8889, "buy": 5.8883, "date": "2026-11-19 13:04:18", "id-account": "42"}
+    assert r.json()["sell"] == 5.8889
 
 
-def test_rota_fallback_desligado(env):
+def test_rota_awesomeapi_fallback_desligado(env):
+    env.setenv("EXCHANGE_PROVIDER", "awesomeapi")
     env.setenv("EXCHANGE_FALLBACK", "none")
     api = FakeApis(awesome_status=429)
     with TestClient(create_app(transport=httpx.MockTransport(api))) as c:
@@ -191,16 +264,15 @@ def test_rota_fallback_desligado(env):
     assert api.ptax_calls == 0
 
 
-def test_rota_ambos_falham_503_e_cache_continua(env):
+def test_rota_awesomeapi_ambos_falham_503_e_cache_continua(env):
+    env.setenv("EXCHANGE_PROVIDER", "awesomeapi")
     api = FakeApis(awesome_status=200, ptax_fail=True)
     with TestClient(create_app(transport=httpx.MockTransport(api))) as c:
         assert get(c, "/exchange/USD/BRL").status_code == 200  # popula o cache
         api.awesome_status = 429
-        # dentro do TTL: cache responde, nenhuma API é chamada
         for _ in range(5):
             assert get(c, "/exchange/USD/BRL").json()["sell"] == 5.3942
         assert api.awesome_calls == 1 and api.ptax_calls == 0
-        # par sem cache e as duas APIs fora: 503
         assert get(c, "/exchange/EUR/BRL").status_code == 503
         assert api.ptax_calls == 1
         text = c.get("/metrics").text
