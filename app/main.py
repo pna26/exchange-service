@@ -5,7 +5,8 @@ Contrato (docs/arquitetura.md do platform):
     GET /exchange/{from}/{to}     header id-account (injetado pelo gateway)
     -> { "sell": float, "buy": float, "date": "YYYY-MM-DD HH:MM:SS", "id-account": "..." }
 
-A cotação vem de uma API de terceiros (AwesomeAPI). Bottleneck tratado aqui:
+A cotação vem de uma API de terceiros (AwesomeAPI), com a PTAX do Banco Central
+como fallback quando ela falha (EXCHANGE_FALLBACK, ver provider.py). Bottleneck tratado aqui:
 cada chamada externa custa ~100-500 ms e a API tem limite de requisições, então
 guardamos a cotação em memória por CACHE_TTL segundos (ver cache.py).
 """
@@ -21,7 +22,9 @@ from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
 from starlette.routing import Match
 
 from .cache import QuoteCache
-from .provider import AwesomeApiProvider, PairNotFound, UpstreamError
+from .provider import AwesomeApiProvider, FallbackProvider, PairNotFound, PtaxProvider, UpstreamError
+
+PTAX_DEFAULT_URL = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata"
 
 CURRENCY = re.compile(r"^[A-Za-z]{3}$")
 
@@ -45,6 +48,13 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
                 base_url=os.getenv("EXCHANGE_API_URL", "https://economia.awesomeapi.com.br/json/last"),
                 token=os.getenv("EXCHANGE_API_TOKEN") or None,
             )
+            # fallback quando a AwesomeAPI falha (no EKS ela devolve 429 para o IP do NAT)
+            fallback = os.getenv("EXCHANGE_FALLBACK", "ptax").strip().lower()
+            if fallback == "ptax":
+                ptax = PtaxProvider(client, base_url=os.getenv("PTAX_BASE_URL", PTAX_DEFAULT_URL))
+                provider = FallbackProvider(provider, ptax, name="ptax")
+            elif fallback != "none":
+                raise ValueError(f"EXCHANGE_FALLBACK inválido: {fallback!r} (use ptax ou none)")
             app.state.cache = QuoteCache(
                 provider.fetch,
                 ttl=float(os.getenv("CACHE_TTL", "30")),

@@ -9,6 +9,8 @@ data:
   CACHE_TTL: "30"
   CACHE_STALE_TTL: "600"
   UPSTREAM_TIMEOUT: "3"
+  # AwesomeAPI devolve 429 para o IP do NAT da AWS; cai na PTAX do Banco Central
+  EXCHANGE_FALLBACK: ptax
 ---
 apiVersion: apps/v1
 kind: Deployment
