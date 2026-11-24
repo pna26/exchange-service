@@ -5,9 +5,14 @@ Contrato (docs/arquitetura.md do platform):
     GET /exchange/{from}/{to}     header id-account (injetado pelo gateway)
     -> { "sell": float, "buy": float, "date": "YYYY-MM-DD HH:MM:SS", "id-account": "..." }
 
-A cotação vem de uma API de terceiros (AwesomeAPI). Bottleneck tratado aqui:
-cada chamada externa custa ~100-500 ms e a API tem limite de requisições, então
-guardamos a cotação em memória por CACHE_TTL segundos (ver cache.py).
+A cotação vem da PTAX do Banco Central (EXCHANGE_PROVIDER=ptax, padrão), porque
+as APIs de câmbio gratuitas não respondem para IPs da AWS; EXCHANGE_PROVIDER=awesomeapi
+volta para a AwesomeAPI com a PTAX como fallback (EXCHANGE_FALLBACK). Ver provider.py.
+
+Bottleneck tratado aqui: cada chamada externa custa ~100-500 ms e não se deve
+martelar a API do BACEN, então guardamos a cotação em memória por CACHE_TTL
+segundos (ver cache.py). O header X-Cache diz se veio do provedor (miss), da
+memória (hit) ou de uma cotação vencida porque o provedor falhou (stale).
 """
 
 import os
@@ -21,7 +26,16 @@ from prometheus_client import CONTENT_TYPE_LATEST, Histogram, generate_latest
 from starlette.routing import Match
 
 from .cache import QuoteCache
-from .provider import AwesomeApiProvider, PairNotFound, UpstreamError
+from .provider import (
+    PTAX_FALLBACK_SECONDS,
+    AwesomeApiProvider,
+    FallbackProvider,
+    PairNotFound,
+    PtaxProvider,
+    UpstreamError,
+)
+
+PTAX_DEFAULT_URL = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata"
 
 CURRENCY = re.compile(r"^[A-Za-z]{3}$")
 
@@ -40,11 +54,26 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         timeout = float(os.getenv("UPSTREAM_TIMEOUT", "3"))
         async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-            provider = AwesomeApiProvider(
-                client,
-                base_url=os.getenv("EXCHANGE_API_URL", "https://economia.awesomeapi.com.br/json/last"),
-                token=os.getenv("EXCHANGE_API_TOKEN") or None,
-            )
+            ptax_url = os.getenv("PTAX_URL") or os.getenv("PTAX_BASE_URL") or PTAX_DEFAULT_URL
+            mode = os.getenv("EXCHANGE_PROVIDER", "ptax").strip().lower()
+            if mode == "ptax":
+                provider = ptax = PtaxProvider(client, base_url=ptax_url)
+            elif mode == "awesomeapi":
+                provider = AwesomeApiProvider(
+                    client,
+                    base_url=os.getenv("EXCHANGE_API_URL", "https://economia.awesomeapi.com.br/json/last"),
+                    token=os.getenv("EXCHANGE_API_TOKEN") or None,
+                )
+                # a PTAX também responde /exchange/currencies; aqui ela mede na métrica do fallback
+                ptax = PtaxProvider(client, base_url=ptax_url, metric=PTAX_FALLBACK_SECONDS)
+                fallback = os.getenv("EXCHANGE_FALLBACK", "ptax").strip().lower()
+                if fallback == "ptax":
+                    provider = FallbackProvider(provider, ptax, name="ptax")
+                elif fallback != "none":
+                    raise ValueError(f"EXCHANGE_FALLBACK inválido: {fallback!r} (use ptax ou none)")
+            else:
+                raise ValueError(f"EXCHANGE_PROVIDER inválido: {mode!r} (use ptax ou awesomeapi)")
+            app.state.ptax = ptax
             app.state.cache = QuoteCache(
                 provider.fetch,
                 ttl=float(os.getenv("CACHE_TTL", "30")),
@@ -80,11 +109,21 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
         # só na rede interna: o gateway só encaminha /exchange/** e o lb não expõe o exchange
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+    @app.get("/exchange/currencies")
+    async def currencies():
+        """Moedas que a PTAX cota (todas contra o real, que também é aceito)."""
+        try:
+            return await app.state.ptax.currencies()
+        except UpstreamError:
+            raise HTTPException(status_code=503, detail="PTAX indisponível, tente de novo")
+
     @app.get("/exchange/{from_}/{to}")
+    @app.get("/exchanges/{from_}/{to}", include_in_schema=False)  # alias do roteiro do curso
     async def exchange(
         from_: str,
         to: str,
         request: Request,
+        response: Response,
         id_account: str | None = Header(default=None, alias="id-account"),
     ):
         # o gateway sempre injeta o id-account depois de validar o JWT; sem ele a
@@ -96,15 +135,17 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
 
         src, dst = from_.upper(), to.upper()
         if src == dst:
+            response.headers["X-Cache"] = "hit"  # nem passa pelo provedor
             return {"sell": 1.0, "buy": 1.0, "date": time.strftime("%Y-%m-%d %H:%M:%S"), "id-account": id_account}
 
         try:
-            quote = await request.app.state.cache.get(src, dst)
+            quote, cache_result = await request.app.state.cache.lookup(src, dst)
         except PairNotFound:
             raise HTTPException(status_code=404, detail=f"par {src}-{dst} não suportado")
         except UpstreamError:
             raise HTTPException(status_code=503, detail="API de câmbio indisponível, tente de novo")
 
+        response.headers["X-Cache"] = cache_result
         return {"sell": quote.sell, "buy": quote.buy, "date": quote.date, "id-account": id_account}
 
     return app

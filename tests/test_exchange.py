@@ -1,4 +1,5 @@
-"""Testes do contrato GET /exchange/{from}/{to} com a API externa simulada."""
+"""Testes do contrato GET /exchange/{from}/{to} no modo EXCHANGE_PROVIDER=awesomeapi,
+com a API externa simulada (o modo padrão, PTAX, está em test_ptax.py)."""
 
 import httpx
 import pytest
@@ -33,6 +34,11 @@ class FakeApi:
         if request.url.path.endswith("/XXX-BRL"):
             return httpx.Response(404, json={"status": 404, "code": "CoinNotExists"})
         return httpx.Response(self.status, json=self.body)
+
+
+@pytest.fixture(autouse=True)
+def modo_awesomeapi(monkeypatch):
+    monkeypatch.setenv("EXCHANGE_PROVIDER", "awesomeapi")
 
 
 @pytest.fixture
